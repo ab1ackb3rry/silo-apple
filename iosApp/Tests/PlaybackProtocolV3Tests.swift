@@ -30,6 +30,51 @@ final class PlaybackProtocolV3Tests: XCTestCase {
         XCTAssertEqual(session.playMethod, "direct")
     }
 
+    // The plan describes the effective file the server actually chose, which
+    // need not be the version the client picked, so its runtime wins over the
+    // catalog's.
+    func testPlanRuntimeOverridesTheCatalogVersionDuration() {
+        let session = ApplePlaybackV3PlanAdapter.playbackSession(
+            plan: makePlan(sourceDurationSeconds: 5_400),
+            sessionId: "session-v3",
+            selectedVersion: makeVersion(container: "mp4", videoCodec: "h264", audioCodec: "aac")
+        )
+
+        XCTAssertEqual(session.durationSeconds, 5_400)
+    }
+
+    // Servers predating source.duration_seconds omit it; the catalog value is
+    // the only remaining source and must still be used.
+    func testMissingPlanRuntimeFallsBackToTheCatalogVersionDuration() {
+        let session = ApplePlaybackV3PlanAdapter.playbackSession(
+            plan: makePlan(sourceDurationSeconds: nil),
+            sessionId: "session-v3",
+            selectedVersion: makeVersion(container: "mp4", videoCodec: "h264", audioCodec: "aac")
+        )
+
+        XCTAssertEqual(session.durationSeconds, 120)
+    }
+
+    // A plan without the field at all must decode: every non-Optional property
+    // on the descriptor is a required key, so a non-Optional duration would
+    // fail the whole plan against an older server.
+    func testPlanDecodesWhenTheSourceRuntimeIsAbsent() throws {
+        let json = """
+        {
+          "media_file_id": 42,
+          "container": "mp4",
+          "hdr10_plus": false,
+          "dv_enhancement_layer": "none"
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let source = try decoder.decode(PlaybackV3SourceDescriptor.self, from: Data(json.utf8))
+
+        XCTAssertNil(source.durationSeconds)
+        XCTAssertEqual(source.mediaFileId, 42)
+    }
+
     func testCanonicalAttemptKeyMatchesGoAndAndroidFixtures() {
         let hls = makePlan(
             planId: "plan:fixture",
@@ -121,7 +166,11 @@ final class PlaybackProtocolV3Tests: XCTestCase {
                     planAttemptId: "apple-plan:attempt",
                     planAttemptKey: plan.attemptKey(outputRouteGeneration: 1),
                     outputRouteGeneration: 1,
-                    serverFeatures: ["playback_plan_v3", "seek_reanchor_v1"],
+                    serverFeatures: [
+                        "playback_plan_v3",
+                        "seek_reanchor_v1",
+                        "direct_stream_resume_v1"
+                    ],
                     plan: plan
                 ),
                 basePlan: base,
@@ -130,8 +179,51 @@ final class PlaybackProtocolV3Tests: XCTestCase {
             )
             XCTAssertEqual(adapted.engine, expectedEngine, delivery)
             XCTAssertEqual(adapted.delivery.name, expectedDelivery.name, delivery)
+            XCTAssertEqual(adapted.wireDelivery, delivery)
+            XCTAssertTrue(
+                adapted.serverFeatures.contains(PlaybackProtocolV3.directStreamResumeFeature)
+            )
+            XCTAssertEqual(
+                adapted.supportsDirectStreamResume,
+                delivery == "original_http",
+                delivery
+            )
             XCTAssertEqual(adapted.startMode.seconds, 4.5, delivery)
         }
+        XCTAssertTrue(
+            ApplePlaybackV3Capabilities.features.contains(
+                PlaybackProtocolV3.directStreamResumeFeature
+            )
+        )
+    }
+
+    func testDirectStreamResumeRequiresResponseFeature() throws {
+        let streamRequest = StreamRequest(
+            url: URL(string: "https://example.test/video")!,
+            headers: ["Authorization": "Bearer test"],
+            serverUrl: "https://example.test"
+        )
+        let plan = makePlan(
+            delivery: "original_http",
+            engine: "media3_direct",
+            streamProtocol: "http_progressive",
+            container: "mp4"
+        )
+        let adapted = try ApplePlaybackV3PlanAdapter.makeExecutionPlan(
+            v3: PreparedPlaybackV3(
+                playbackAttemptId: "apple:attempt",
+                planAttemptId: "apple-plan:attempt",
+                planAttemptKey: plan.attemptKey(outputRouteGeneration: 1),
+                outputRouteGeneration: 1,
+                serverFeatures: ["playback_plan_v3"],
+                plan: plan
+            ),
+            basePlan: makeBaseExecutionPlan(streamRequest: streamRequest),
+            streamRequest: streamRequest,
+            routeRequirements: .baseline
+        )
+
+        XCTAssertFalse(adapted.supportsDirectStreamResume)
     }
 
     func testUnsupportedClientRequirementsAreRejected() {
@@ -339,7 +431,8 @@ final class PlaybackProtocolV3Tests: XCTestCase {
         appliedQuirks: [PlaybackV3AppliedQuirk] = [],
         runtimeCorrections: [String] = [],
         playerStart: Double = 4.5,
-        timelineOffset: Double = 0
+        timelineOffset: Double = 0,
+        sourceDurationSeconds: Double? = 5_400
     ) -> PlaybackV3Plan {
         PlaybackV3Plan(
             protocolVersion: 3,
@@ -414,6 +507,7 @@ final class PlaybackProtocolV3Tests: XCTestCase {
             effectiveMediaFileId: 42,
             source: PlaybackV3SourceDescriptor(
                 mediaFileId: 42,
+                durationSeconds: sourceDurationSeconds,
                 container: container,
                 videoCodec: videoCodec,
                 videoProfile: "high",
